@@ -7,8 +7,6 @@ on:
 
 permissions:
   contents: write
-  issues: write
-  pull-requests: write
 
 concurrency:
   group: link-rot-sweep
@@ -25,16 +23,32 @@ jobs:
           fetch-depth: 0
 
       - name: Check every link in README.md
+        id: check
         run: |
-          # check-links exits 1 as soon as any URL is dead/suspect -- that's the
-          # expected, reportable outcome of a link-rot sweep, not a script
-          # failure, so `|| true` here (state commit + issue upsert below are
-          # what actually need to keep running either way).
-          python3 scripts/check_readme.py check-links --all --state .github/link-rot-state.json --json > /tmp/results.json || true
-          python3 -c "import json; print('stats:', json.load(open('/tmp/results.json'))['stats'])" >> "$GITHUB_STEP_SUMMARY"
+          # Exit 1 means dead/suspect links only if a complete, consistent JSON
+          # report was produced. Other failures must fail the job.
+          set +e
+          python3 scripts/check_readme.py check-links --all --state .github/link-rot-state.json --json > /tmp/results.json
+          status=$?
+          set -e
+          python3 - "$status" <<'PY'
+          import json, sys
+          with open('/tmp/results.json', encoding='utf-8') as f:
+              data = json.load(f)
+          results, stats = data['results'], data['stats']
+          assert data['generated_from'] == 'all' and isinstance(results, list)
+          classes = ('OK', 'HARD_DEAD', 'SUSPECT', 'BLOCKED')
+          assert all(r['class'] in classes for r in results)
+          assert stats == {'total': len(results), **{c.lower(): sum(r['class'] == c for r in results) for c in classes}}
+          expected = 1 if stats['hard_dead'] or stats['suspect'] else 0
+          assert int(sys.argv[1]) == expected, 'link checker failed unexpectedly'
+          PY
+          cp .github/link-rot-state.json /tmp/link-rot-state.json
 
       - name: Commit updated sweep state
-        continue-on-error: true
+        id: state
+        env:
+          REF_NAME: ${{ github.ref_name }}
         run: |
           if git diff --quiet -- .github/link-rot-state.json; then
             echo "No state changes to commit."
@@ -43,72 +57,55 @@ jobs:
             git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
             git add .github/link-rot-state.json
             git commit -m "chore(link-rot): update sweep state [skip ci]"
-            git pull --rebase origin "${{ github.ref_name }}"
-            git push origin "HEAD:${{ github.ref_name }}"
+            git pull --rebase origin "$REF_NAME"
+            git push origin "HEAD:$REF_NAME"
           fi
-
-      - name: Apply safe auto-fixes (remove confirmed-dead entries, update moved URLs)
-        id: prune
-        if: always()
-        continue-on-error: true
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          # Only two categories are safe enough to fix without a human decision:
-          # entries confirmed dead for 2+ consecutive weeks (with no known redirect),
-          # and URLs that now redirect to a different working page. Everything else
-          # (SUSPECT, secondary/prose links, ambiguous matches) is left in the
-          # report for a human to judge -- see scripts/check_readme.py's cmd_prune
-          # docstring for the exact rules.
-          python3 scripts/check_readme.py prune \
-            --results /tmp/results.json --state .github/link-rot-state.json \
-            --readme README.md --pr-body-out /tmp/pr-body.md > /tmp/prune-summary.json
-          changed=$(python3 -c "import json; print(json.load(open('/tmp/prune-summary.json'))['changed'])")
-          if [ "$changed" != "True" ]; then
-            echo "Nothing to auto-fix this run."
-            exit 0
-          fi
-
-          removed=$(python3 -c "import json; print(len(json.load(open('/tmp/prune-summary.json'))['removals']))")
-          updated=$(python3 -c "import json; print(len(json.load(open('/tmp/prune-summary.json'))['updates']))")
-          branch="automated/link-rot-fixes"
-
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -B "$branch"
-          git add README.md
-          git commit -m "chore(link-rot): remove $removed confirmed-dead link(s), update $updated moved URL(s)"
-          git push --force-with-lease origin "HEAD:$branch"
-
-          if [ -z "$(gh pr list --repo "${{ github.repository }}" --head "$branch" --state open --json number --jq '.[0].number // empty')" ]; then
-            gh pr create --repo "${{ github.repository }}" --base "${{ github.ref_name }}" --head "$branch" \
-              --title "chore(link-rot): remove $removed confirmed-dead link(s), update $updated moved URL(s)" \
-              --body-file /tmp/pr-body.md --label link-rot
-          else
-            gh pr edit "$branch" --repo "${{ github.repository }}" --body-file /tmp/pr-body.md
-          fi
-          pr_url=$(gh pr view "$branch" --repo "${{ github.repository }}" --json url --jq '.url')
-          echo "pr_url=$pr_url" >> "$GITHUB_OUTPUT"
 
       - name: Render report body
-        if: always()
-        env:
-          FIX_PR_URL: ${{ steps.prune.outputs.pr_url }}
+        id: report
+        if: always() && steps.check.outcome == 'success'
         run: |
-          if [ -n "$FIX_PR_URL" ]; then
-            python3 scripts/check_readme.py report --results /tmp/results.json --state .github/link-rot-state.json --fix-pr-url "$FIX_PR_URL" > /tmp/report-body.md
-          else
-            python3 scripts/check_readme.py report --results /tmp/results.json --state .github/link-rot-state.json > /tmp/report-body.md
-          fi
+          python3 scripts/check_readme.py report --results /tmp/results.json --state /tmp/link-rot-state.json > /tmp/report-body.md
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/report-body.md')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace("Please open a pull request to fix an entry -- don't reply here with fixes, this issue body is fully rewritten on every run.", "Please open a pull request to fix an entry.")
+          path.write_text(text, encoding='utf-8')
+          PY
 
-      - name: Upsert consolidated link-rot report issue
+      - name: Publish job summary
         if: always()
         env:
-          GH_TOKEN: ${{ github.token }}
+          CHECK_OUTCOME: ${{ steps.check.outcome }}
+          REPORT_OUTCOME: ${{ steps.report.outcome }}
+          STATE_OUTCOME: ${{ steps.state.outcome }}
         run: |
-          existing=$(gh issue list --repo "${{ github.repository }}" --search "🔗 Link rot report in:title" --label link-rot --state open --json number --jq '.[0].number // empty')
-          if [ -n "$existing" ]; then
-            gh issue edit "$existing" --repo "${{ github.repository }}" --body-file /tmp/report-body.md
-          else
-            gh issue create --repo "${{ github.repository }}" --title "🔗 Link rot report" --label link-rot --body-file /tmp/report-body.md
-          fi
+          python3 - <<'PY'
+          import json, os
+          from pathlib import Path
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as summary:
+              summary.write('# Link rot sweep\n\n')
+              summary.write('Automatic fix PR creation is disabled to protect the existing automated/link-rot-fixes branch. Please review and fix links manually.\n\n')
+              summary.write(f"Check: {os.environ['CHECK_OUTCOME']}; state commit: {os.environ['STATE_OUTCOME']}; report: {os.environ['REPORT_OUTCOME']}.\n\n")
+              if os.environ['CHECK_OUTCOME'] == 'success':
+                  stats = json.loads(Path('/tmp/results.json').read_text(encoding='utf-8'))['stats']
+                  summary.write('Stats: ' + ', '.join(f'{k}: {v}' for k, v in stats.items()) + '\n\n')
+              if os.environ['REPORT_OUTCOME'] == 'success':
+                  report = Path('/tmp/report-body.md').read_text(encoding='utf-8')
+                  summary.write(report[:50000])
+                  if len(report) > 50000:
+                      summary.write('\n\n_Report truncated in summary; see the link-rot-report artifact for the full report._\n')
+              summary.write('\n\nFull report and raw results, when available, are in the link-rot-report artifact.\n')
+          PY
+
+      - name: Upload full report and raw results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: link-rot-report
+          path: |
+            /tmp/results.json
+            /tmp/report-body.md
+            /tmp/link-rot-state.json
+          if-no-files-found: warn
