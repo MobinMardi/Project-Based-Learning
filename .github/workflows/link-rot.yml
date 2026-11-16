@@ -66,6 +66,13 @@ jobs:
         if: always() && steps.check.outcome == 'success'
         run: |
           python3 scripts/check_readme.py report --results /tmp/results.json --state /tmp/link-rot-state.json > /tmp/report-body.md
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('/tmp/report-body.md')
+          text = path.read_text(encoding='utf-8')
+          text = text.replace("Please open a pull request to fix an entry -- don't reply here with fixes, this issue body is fully rewritten on every run.", "Please open a pull request to fix an entry.")
+          path.write_text(text, encoding='utf-8')
+          PY
 
       - name: Publish job summary
         if: always()
